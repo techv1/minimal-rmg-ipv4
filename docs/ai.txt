@@ -1,0 +1,340 @@
+For your **SM-X216B / Linux 5.4.249**, the most useful roadmap is to treat each stage as a **checkpoint**. Do not move to the next stage until the previous one is independently verified.
+
+Your supplied evidence already establishes the target identity, `CONFIG_FUTEX_PI`, relevant futex symbols, and the 5.4 `rt_mutex_waiter` layout. kernel_profile_verified kernel_profile_verified kernel_profile_verified
+
+## Roadmap
+
+```text
+STEP 0
+Target baseline
+   ↓
+STEP 1
+Kernel / symbol verification
+   ↓
+STEP 2
+Futex waiter geometry
+   ↓
+STEP 3
+MCAST kernel call-chain verification
+   ↓
+STEP 4
+MCAST ↔ waiter geometry correlation
+   ↓
+STEP 5
+Compare reference implementations
+   ↓
+STEP 6
+Benign MCAST test harness
+   ↓
+STEP 7
+Isolated vulnerability validation
+   ↓
+STEP 8
+Verify resulting primitive conceptually
+   ↓
+STEP 9
+Only then study post-corruption/root layer
+```
+
+### STEP 0 — Lock down the exact target
+
+**Success means:**
+
+```text
+SM-X216B
+X216BXXS9DYJ7
+5.4.249-qgki-31053672
+SM6375
+ARM64
+QGKI
+```
+
+all match your kernel image/config/profile.
+
+Your supplied files already record these values. kernel_profile_verified
+
+---
+
+### STEP 1 — Verify the kernel symbols
+
+Confirm independently that the target `vmlinux` contains:
+
+```text
+do_futex
+futex_requeue
+futex_wait_requeue_pi
+remove_waiter
+rt_mutex_adjust_prio_chain
+rt_mutex_start_proxy_lock
+rt_mutex_cleanup_proxy_lock
+```
+
+Your current evidence marks these as verified from `kallsyms` and ELF/disassembly. kernel_profile_verified
+
+**Checkpoint:** no unresolved critical symbol.
+
+---
+
+### STEP 2 — Verify `rt_mutex_waiter`
+
+This is one of the most important milestones.
+
+Your current target evidence says:
+
+```text
+rt_mutex_waiter = 0x50 bytes
+
+tree_entry       +0x00
+pi_tree_entry    +0x18
+task             +0x30
+lock             +0x38
+prio             +0x40
+deadline         +0x48
+```
+
+and the `task`/`lock` offsets are backed by disassembly. kernel_profile_verified
+
+**Success means:** you can explain where the waiter is created, how it is cleaned up, and which fields later code dereferences.
+
+Do not proceed based only on a header or a copied offset from another device.
+
+---
+
+### STEP 3 — Verify the MCAST call chain on your actual kernel
+
+The next question is simply:
+
+> Does your 5.4 kernel actually create the expected `group_source_req` stack object in `do_ip_setsockopt()`?
+
+Your supplied report says yes:
+
+```text
+setsockopt
+  ↓
+__sys_setsockopt
+  ↓
+sock_common_setsockopt
+  ↓
+ip_setsockopt
+  ↓
+do_ip_setsockopt
+  ↓
+local stack buffer
+  ↓
+copy_from_user(..., 0x108)
+```
+
+with a 264-byte copy. smx216b_mcast_geometry_report
+
+**Checkpoint:** source + disassembly agree.
+
+---
+
+### STEP 4 — Correlate the two stack frames
+
+Now compare:
+
+```text
+futex waiter location
+vs.
+MCAST local-buffer location
+```
+
+Your report calculates:
+
+```text
+waiter base inside MCAST buffer = 0xc8
+task field = 0xf8
+lock field = 0x100
+```
+
+and says both relevant fields are within the 264-byte copied region. smx216b_mcast_geometry_report
+
+Your `target.h` records the same target-specific relationship. target target
+
+**This is your first major MCAST milestone.**
+
+It establishes:
+
+> **The MCAST carrier is geometrically compatible with the stale waiter on this kernel.**
+
+It does **not** establish end-to-end exploitation.
+
+---
+
+### STEP 5 — Compare references
+
+Now use the references in this order:
+
+```text
+G990B2
+  ↓
+Huawei
+  ↓
+X710 / X916B / S918B / S916B
+  ↓
+Lenovo
+  ↓
+GhostLockAdapt
+  ↓
+Vivo/iQOO
+```
+
+For every reference extract only:
+
+```text
+kernel version
+waiter layout
+MCAST option
+MCAST handler
+stack frame
+writer abstraction
+validation status
+```
+
+The objective is to answer:
+
+> What is common to MCAST across kernels, and what is target-specific?
+
+Do not copy offsets or root-stage constants.
+
+---
+
+### STEP 6 — Build a benign MCAST harness
+
+Before touching any vulnerability code, prove the ordinary kernel path independently:
+
+```text
+socket(AF_INET, ...)
+        ↓
+setsockopt(... MCAST_BLOCK_SOURCE ...)
+        ↓
+kernel
+        ↓
+IPv4 multicast handler
+```
+
+Use it only to verify:
+
+- option accepted;
+- expected kernel path reached;
+- expected argument size;
+- expected behavior on your kernel.
+
+**Success:** the ordinary MCAST path behaves exactly as predicted by your disassembly.
+
+This isolates “MCAST works” from “GhostLock works.”
+
+---
+
+### STEP 7 — Validate the vulnerability in an isolated research environment
+
+This is where you move from static analysis to dynamic confirmation.
+
+The safe milestone is:
+
+```text
+PI/futex state
+   ↓
+documented lifetime transition
+   ↓
+stale waiter condition
+   ↓
+observable corruption / invalid lifetime behavior
+```
+
+Use an emulator, instrumented kernel, or another isolated test environment where possible.
+
+The important thing to prove is **the lifetime bug**, not immediately root.
+
+Do not optimize race timing, heap grooming, or construct a working privilege-escalation payload as the first objective.
+
+---
+
+### STEP 8 — Verify the MCAST writer conceptually
+
+Once the UAF behavior and MCAST geometry are independently established, correlate:
+
+```text
+stale waiter
+      +
+MCAST stack-local copy
+      +
+expected overlapping fields
+```
+
+Your success criterion is an **observable, controlled research artifact** showing that the expected stack locations are interacting as predicted.
+
+Do not jump directly from geometry to arbitrary kernel writes.
+
+---
+
+### STEP 9 — Separate the downstream stages
+
+Only after the previous stages work should you analyze:
+
+```text
+W1 / memory primitive
+       ↓
+W2 / credential effect
+       ↓
+W3 / execution-context restrictions
+       ↓
+root child
+       ↓
+KernelSU handoff
+```
+
+These are separate problems.
+
+Your `target.h` shows your kernel also has:
+
+```text
+CONFIG_CFI_CLANG=y
+CONFIG_SHADOW_CALL_STACK=y
+CONFIG_HARDENED_USERCOPY=y
+SELinux
+DEFEX
+```
+
+so later-stage assumptions from another phone should not be treated as automatically valid. kernel_profile_verified
+
+---
+
+# What “success” should look like
+
+I would use this checklist:
+
+| Stage | Success condition |
+|---|---|
+| 0 | Exact kernel/profile match |
+| 1 | Critical symbols verified |
+| 2 | Waiter layout independently verified |
+| 3 | MCAST call chain independently verified |
+| 4 | MCAST/waiter overlap mathematically confirmed |
+| 5 | Reference differences documented |
+| 6 | Ordinary MCAST path reproduced benignly |
+| 7 | PI-UAF lifetime behavior observed in isolation |
+| 8 | MCAST/waiter interaction experimentally correlated |
+| 9 | Downstream/root stages analyzed separately |
+
+### Your current position
+
+Based on the files you supplied, you're already around:
+
+```text
+STEP 0  ✅
+STEP 1  ✅
+STEP 2  ✅
+STEP 3  ✅
+STEP 4  ✅
+STEP 5  🔄
+STEP 6  ⬜
+STEP 7  ⬜
+STEP 8  ⬜
+STEP 9  ⬜
+```
+
+The strongest evidence you have right now is **not that the complete exploit works**; it is that your **5.4.249 native MCAST geometry is internally consistent and overlaps the verified 5.4 `rt_mutex_waiter` in the way the research model predicts**. smx216b_mcast_geometry_report
+
+The next sensible milestone is therefore **a benign verification of your X216B `MCAST_BLOCK_SOURCE` call path against the disassembled `do_ip_setsockopt()` frame**, rather than immediately adapting a full rooting PoC.

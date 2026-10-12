@@ -1,0 +1,10 @@
+# Platform tools binaries and archives
+platform-tools/
+platform-tools-latest-linux.zip
+
+# Build and temporary files
+*.log
+*.o
+*.a
+*.so
+build_tmp/

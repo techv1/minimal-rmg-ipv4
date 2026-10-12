@@ -112,5 +112,14 @@ int phase2_bridge_diag(void) {
            ok ? "inputs-ok" : "inputs-not-ready");
     printf("[phase2] no credential or workqueue write attempted\n");
 
+    int diag_fd = open("/dev/ashmem", O_RDWR);
+    char diag_buf[8];
+    errno = 0;
+    ssize_t diag_r = read(diag_fd, diag_buf, sizeof(diag_buf));
+    printf("[DIAG] ashmem read ret=%zd errno=%d\n", diag_r, errno);
+    if (diag_fd >= 0) {
+        close(diag_fd);
+    }
+
     return ok ? 2 : 1;
 }

